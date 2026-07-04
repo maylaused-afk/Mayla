@@ -7,7 +7,7 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="theme-color" content="#6366f1">
 <meta name="apple-mobile-web-app-title" content="工作室账本">
-<link rel="manifest" href="/manifest.json">
+<link rel="manifest" href="./manifest.json">
 <link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%22192%22 height=%22192%22 viewBox=%220 0 192 192%22><rect width=%22192%22 height=%22192%22 rx=%2240%22 fill=%22%236366f1%22/><text x=%2296%22 y=%22120%22 font-size=%22100%22 text-anchor=%22middle%22>📒</text></svg>">
 <title>手账工作室记账</title>
 <style>
@@ -661,14 +661,30 @@ class Store {
     localStorage.setItem(LS_KEYS.expenses, JSON.stringify(filtered));
   }
 
+  static getLastModified() {
+    const purchases = JSON.parse(localStorage.getItem(LS_KEYS.purchases) || '[]');
+    const expenses = JSON.parse(localStorage.getItem(LS_KEYS.expenses) || '[]');
+    const configs = JSON.parse(localStorage.getItem(LS_KEYS.configs) || '{}');
+    let maxTime = 0;
+    purchases.forEach(p => { if (p.createdAt > maxTime) maxTime = p.createdAt; });
+    expenses.forEach(e => { if (e.createdAt > maxTime) maxTime = e.createdAt; });
+    Object.values(configs).forEach(c => { if (c._updatedAt > maxTime) maxTime = c._updatedAt; });
+    return maxTime;
+  }
+
+  static getDataCount() {
+    const purchases = JSON.parse(localStorage.getItem(LS_KEYS.purchases) || '[]');
+    const expenses = JSON.parse(localStorage.getItem(LS_KEYS.expenses) || '[]');
+    return { purchases: purchases.length, expenses: expenses.length };
+  }
+
   static getConfig(month) {
     const all = JSON.parse(localStorage.getItem(LS_KEYS.configs) || '{}');
-    return all[month] || { gmv: 0, costRate: 40, coefficient: 0.8, manualBudget: null, inventoryEstimate: 0 };
-  }
+    return all[month] || { gmv: 0, costRate: 40, coefficient: 0.8, manualBudget: null, inventoryEstimate: 0 };  }
 
   static setConfig(month, data) {
     const all = JSON.parse(localStorage.getItem(LS_KEYS.configs) || '{}');
-    all[month] = { ...(all[month] || {}), ...data };
+    all[month] = { ...(all[month] || {}), ...data, _updatedAt: Date.now() };
     localStorage.setItem(LS_KEYS.configs, JSON.stringify(all));
   }
 
@@ -699,7 +715,73 @@ class App {
     this.editingId = null;
     this.editingType = null;
     this.months = this._collectMonths();
+    this._lastBackupTime = parseInt(localStorage.getItem('fa_last_backup_time') || '0');
+    this._backupReminderDismissed = sessionStorage.getItem('fa_backup_dismissed') === 'true';
     this.init();
+  }
+
+  _checkBackupReminder() {
+    if (this._backupReminderDismissed) return;
+    const lastModified = Store.getLastModified();
+    const counts = Store.getDataCount();
+    const totalRecords = counts.purchases + counts.expenses;
+    const hoursSinceBackup = (Date.now() - this._lastBackupTime) / 3600000;
+
+    // 有至少5条记录，且超过24小时没备份，就提醒
+    if (totalRecords >= 5 && hoursSinceBackup >= 24 && lastModified > this._lastBackupTime) {
+      this._showBackupReminder();
+    }
+  }
+
+  _showBackupReminder() {
+    const counts = Store.getDataCount();
+    const hoursSinceBackup = this._lastBackupTime === 0 ? '从未' : Math.round((Date.now() - this._lastBackupTime) / 3600000) + '小时';
+    this._showModal(`
+      <div class="modal-handle"></div>
+      <div style="text-align:center;font-size:48px;margin-bottom:12px;">⚠️</div>
+      <div class="modal-title">该备份了！</div>
+      <div style="text-align:center;color:var(--text-secondary);margin-bottom:20px;">
+        上次备份：<b>${hoursSinceBackup}</b>前<br>
+        你有 <b>${counts.purchases}</b> 条进货 + <b>${counts.expenses}</b> 条支出 还没备份<br><br>
+        <span style="color:var(--danger);font-size:13px;">Safari清缓存或换手机，数据就没了</span>
+      </div>
+      <div style="display:flex;gap:8px;">
+        <button class="btn btn-outline" onclick="app.dismissBackupReminder()" style="flex:1;">🔕 晚点再说</button>
+        <button class="btn btn-primary" onclick="app.doBackupNow()" style="flex:1;">📤 立即备份</button>
+      </div>
+    `);
+  }
+
+  dismissBackupReminder() {
+    sessionStorage.setItem('fa_backup_dismissed', 'true');
+    this._backupReminderDismissed = true;
+    this.closeModal();
+    this.showToast('🔕 今天不会再提醒了');
+  }
+
+  doBackupNow() {
+    const data = Store.getAllData();
+    const json = JSON.stringify(data, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const [y, m] = this.currentMonth.split('-');
+    a.download = `工作室账本备份_${y}年${parseInt(m)}月.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    localStorage.setItem('fa_last_backup_time', String(Date.now()));
+    this._lastBackupTime = Date.now();
+    this.closeModal();
+    this.showToast('✅ 备份已保存！请发到微信或保存到文件');
+  }
+
+  _afterDataChange() {
+    // 每次添加/编辑/删除数据后，延迟检查是否需要提醒备份
+    clearTimeout(this._backupCheckTimer);
+    this._backupCheckTimer = setTimeout(() => this._checkBackupReminder(), 2000);
   }
 
   _collectMonths() {
@@ -717,6 +799,8 @@ class App {
     this._bindFab();
     this._bindModal();
     this.render();
+    // 启动时延后检查是否需要提醒备份
+    setTimeout(() => this._checkBackupReminder(), 3000);
   }
 
   _bindNav() {
@@ -1140,6 +1224,7 @@ class App {
 
     Store.setConfig(this.currentMonth, { gmv, costRate, coefficient, manualBudget, inventoryEstimate });
     this.showToast('✅ 设置已保存');
+    this._afterDataChange();
     this.renderDashboard();
   }
 
@@ -1243,6 +1328,7 @@ class App {
     this.editingType = null;
     this.closeModal();
     this.render();
+    this._afterDataChange();
   }
 
   confirmDeletePurchase(id) {
@@ -1266,6 +1352,7 @@ class App {
     this.editingId = null;
     this.closeModal();
     this.render();
+    this._afterDataChange();
   }
 
   showAddExpense() {
@@ -1354,6 +1441,7 @@ class App {
     this.editingType = null;
     this.closeModal();
     this.render();
+    this._afterDataChange();
   }
 
   confirmDeleteExpense(id) {
@@ -1377,6 +1465,7 @@ class App {
     this.editingId = null;
     this.closeModal();
     this.render();
+    this._afterDataChange();
   }
 
   // ==================== QUICK DECISION ====================
