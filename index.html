@@ -516,8 +516,14 @@ html, body {
 <div class="app-container" id="app">
   <!-- Header -->
   <header class="app-header">
-    <h1>📒 工作室账本</h1>
-    <span class="header-month" id="headerMonth">7月</span>
+    <div>
+      <h1>📒 工作室账本</h1>
+      <div id="userStatus" style="font-size:11px;color:var(--text-muted);margin-top:2px;">未登录 · 当前仅本地保存</div>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;">
+      <button id="authBtn" class="btn btn-sm btn-outline" style="display:none;">登录</button>
+      <span class="header-month" id="headerMonth">7月</span>
+    </div>
   </header>
 
   <!-- Main Content -->
@@ -564,13 +570,53 @@ html, body {
   <div class="toast" id="toast"></div>
 </div>
 
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <script>
-// ==================== 数据层 ====================
+// ==================== Firebase ====================
+const firebaseConfig = {
+  apiKey: "AIzaSyDy0C6xFH2qmu1SrRnTb-taXeo6Hm64saM",
+  authDomain: "studio-finance-e2a1f.firebaseapp.com",
+  databaseURL: "https://studio-finance-e2a1f-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId: "studio-finance-e2a1f",
+  storageBucket: "studio-finance-e2a1f.firebasestorage.app",
+  messagingSenderId: "295801837486",
+  appId: "1:295801837486:web:3460eab6eda987cb479a3f",
+  measurementId: "G-DH7WDE7E6L"
+};
+
+firebase.initializeApp(firebaseConfig);
+const auth = firebase.auth();
+const db = firebase.firestore();
+
+const CloudStore = {
+  currentUser: null,
+  async saveAll(data) {
+    if (!this.currentUser) return false;
+    const ref = db.collection('users').doc(this.currentUser.uid).collection('app').doc('finance');
+    await ref.set({
+      ...data,
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+      userEmail: this.currentUser.email || ''
+    }, { merge: true });
+    return true;
+  },
+  async loadAll() {
+    if (!this.currentUser) return null;
+    const ref = db.collection('users').doc(this.currentUser.uid).collection('app').doc('finance');
+    const snap = await ref.get();
+    return snap.exists ? snap.data() : null;
+  }
+};
+
 const LS_KEYS = {
   purchases: 'fa_purchases',
   expenses: 'fa_expenses',
   configs: 'fa_configs',
 };
+
+let suppressCloudSync = false;
 
 function uid() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
@@ -693,13 +739,27 @@ class Store {
       purchases: JSON.parse(localStorage.getItem(LS_KEYS.purchases) || '[]'),
       expenses: JSON.parse(localStorage.getItem(LS_KEYS.expenses) || '[]'),
       configs: JSON.parse(localStorage.getItem(LS_KEYS.configs) || '{}'),
+      exportedAt: Date.now()
     };
   }
 
-  static importAllData(data) {
+  static async syncToCloud() {
+    if (suppressCloudSync || !CloudStore.currentUser) return;
+    try {
+      await CloudStore.saveAll(this.getAllData());
+    } catch (e) {
+      console.error('Cloud sync failed:', e);
+    }
+  }
+
+  static replaceAllData(data) {
     if (data.purchases) localStorage.setItem(LS_KEYS.purchases, JSON.stringify(data.purchases));
     if (data.expenses) localStorage.setItem(LS_KEYS.expenses, JSON.stringify(data.expenses));
     if (data.configs) localStorage.setItem(LS_KEYS.configs, JSON.stringify(data.configs));
+  }
+
+  static importAllData(data) {
+    this.replaceAllData(data);
   }
 
   static clearAll() {
@@ -782,6 +842,8 @@ class App {
     // 每次添加/编辑/删除数据后，延迟检查是否需要提醒备份
     clearTimeout(this._backupCheckTimer);
     this._backupCheckTimer = setTimeout(() => this._checkBackupReminder(), 2000);
+    clearTimeout(this._cloudSyncTimer);
+    this._cloudSyncTimer = setTimeout(() => Store.syncToCloud(), 1200);
   }
 
   _collectMonths() {
@@ -798,9 +860,75 @@ class App {
     this._bindNav();
     this._bindFab();
     this._bindModal();
+    this._bindAuth();
     this.render();
     // 启动时延后检查是否需要提醒备份
     setTimeout(() => this._checkBackupReminder(), 3000);
+  }
+
+  _bindAuth() {
+    const authBtn = document.getElementById('authBtn');
+    authBtn.style.display = 'inline-flex';
+    authBtn.addEventListener('click', async () => {
+      if (CloudStore.currentUser) {
+        await auth.signOut();
+        return;
+      }
+      try {
+        const provider = new firebase.auth.GoogleAuthProvider();
+        await auth.signInWithPopup(provider);
+      } catch (e) {
+        this.showToast('⚠️ 登录失败，请重试');
+        console.error(e);
+      }
+    });
+
+    auth.onAuthStateChanged(async (user) => {
+      CloudStore.currentUser = user || null;
+      this._updateAuthUI(user);
+      if (user) {
+        await this._loadFromCloud();
+      }
+    });
+  }
+
+  _updateAuthUI(user) {
+    const authBtn = document.getElementById('authBtn');
+    const status = document.getElementById('userStatus');
+    if (user) {
+      authBtn.textContent = '退出';
+      status.textContent = `已登录 · ${user.email || '云端同步已开启'}`;
+    } else {
+      authBtn.textContent = '登录';
+      status.textContent = '未登录 · 当前仅本地保存';
+    }
+  }
+
+  async _loadFromCloud() {
+    try {
+      const cloudData = await CloudStore.loadAll();
+      if (!cloudData) {
+        await Store.syncToCloud();
+        this.showToast('☁️ 已开启云端同步');
+        return;
+      }
+
+      const localModified = Store.getLastModified();
+      const cloudUpdated = cloudData.updatedAt?.seconds ? cloudData.updatedAt.seconds * 1000 : 0;
+      if (cloudUpdated >= localModified) {
+        suppressCloudSync = true;
+        Store.replaceAllData(cloudData);
+        suppressCloudSync = false;
+        this.render();
+        this.showToast('☁️ 已从云端读取数据');
+      } else {
+        await Store.syncToCloud();
+        this.showToast('☁️ 本地新数据已同步到云端');
+      }
+    } catch (e) {
+      console.error(e);
+      this.showToast('⚠️ 云端同步失败，暂时使用本地数据');
+    }
   }
 
   _bindNav() {
@@ -1139,6 +1267,15 @@ class App {
     const budget = config.manualBudget != null ? config.manualBudget : autoBudget;
 
     panel.innerHTML = `
+      <div class="settings-section">
+        <h3>☁️ 云端同步</h3>
+        <div class="card">
+          <div style="font-size:14px;font-weight:600;margin-bottom:6px;">Google 云同步</div>
+          <div style="font-size:13px;color:var(--text-secondary);margin-bottom:12px;">${CloudStore.currentUser ? `已登录：${this._escapeHtml(CloudStore.currentUser.email || '')}` : '登录后可在 iPhone / 安卓 / 新设备自动同步数据'}</div>
+          <button class="btn ${CloudStore.currentUser ? 'btn-outline' : 'btn-primary'}" id="settingsAuthBtn" onclick="document.getElementById('authBtn').click()">${CloudStore.currentUser ? '退出登录' : '登录并开启同步'}</button>
+        </div>
+      </div>
+
       <div class="settings-section">
         <h3>📊 ${this._formatMonthLabel(this.currentMonth)} 预算设置</h3>
         <div class="card">
@@ -1634,6 +1771,8 @@ class App {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
+    localStorage.setItem('fa_last_backup_time', String(Date.now()));
+    this._lastBackupTime = Date.now();
     this.showToast('✅ 数据已导出，请保存好文件');
   }
 
